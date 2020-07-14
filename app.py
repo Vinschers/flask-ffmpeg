@@ -1,15 +1,57 @@
 import os
 import subprocess
-from flask import Flask, request
+from flask import Flask, request, Response
 import ffmpeg
 import tempfile
 import shlex
+import threading
+import io
 
+class VideoConverter(object):
+    def __init__(self, bytes):
+        self.input = io.BytesIO(bytes)
 
-def process(in_file, out_file):
-    cmd = 'ffmpeg -f matroska -i pipe:0 -vcodec libx265 -f matroska pipe:1'
-    p = subprocess.Popen(shlex.split(cmd), stdin=in_file, stdout=out_file)
-    p.wait()
+    def _execute_process(self, p:subprocess.Popen, read_chunk_size=-1):
+        def getData(p):
+            while True:
+                chunk = self.input.read(read_chunk_size)
+                if not chunk:
+                    break
+                p.stdin.write(chunk)
+
+            p.stdin.close()
+            self.input.seek(0)
+
+        def sendData(p):
+            out = p.stdout
+            while True:
+                try:
+                    chunk = out.read(8*1024)
+                    if not chunk:
+                        raise Exception()
+                    yield chunk
+                except Exception:
+                    out.close()
+                    p.wait()
+                    break
+
+        tGet = threading.Thread(target=getData, args=(p,))
+        tGet.start()
+
+        for c in sendData(p):
+            yield c
+
+    def custom_process(self, read_chunk_size=-1):
+        p = (
+            ffmpeg
+            .input('pipe:', format='matroska')
+            .output('pipe:', vcodec='libx265', format='matroska')
+            .overwrite_output()
+            .run_async(pipe_stdin=True, pipe_stdout=True)
+        )
+        
+        for chunk in self._execute_process(p):
+            yield chunk
 
 
 app = Flask(__name__)
@@ -17,18 +59,10 @@ app = Flask(__name__)
 
 @app.route('/upload', methods=['POST'])
 def upload():
-    up_file = request.files['file'].stream
+    file = request.files['file']
+    conv = VideoConverter(file.read())
 
-    in_file = tempfile.TemporaryFile()
-    in_file.write(up_file.read())
-    in_file.seek(0)
-    out_file = tempfile.TemporaryFile()
-
-    process(in_file, out_file)
-
-    out_file.seek(0)
-
-    return out_file.read()
+    return Response(conv.custom_process())
 
 
 if __name__ == "__main__":
